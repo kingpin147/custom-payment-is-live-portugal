@@ -1,0 +1,87 @@
+import { createIfthenpayCheckout } from 'backend/checkOut.web';
+
+export async function testCheckout() {
+    try {
+        // Define payment details dynamically (replace with real values as needed)
+        const paymentDetails = {
+            orderId: "ORD" + Date.now(), // Unique order ID
+            amount: "10.50", // Payment amount in XX.XX format
+            description: "Order Payment", // Description of the order
+            expire: "20251231", // Expiration date in YYYYMMDD format
+            lang: "EN", // Language for the payment page (PT, EN, ES)
+            successUrl: "https://www.live-ls.com/contato", // Success URL after payment
+            cancelUrl: "https://www.live-ls.com/", // Cancel URL for canceled payments
+            errorUrl: "https://www.live-ls.com/shows", // Error URL in case of failure
+            selectedMethod: "2", // Optional: Pre-select payment method (MBWAY, etc.)
+            iframe: "true", // Optional: Enable iframe for displaying the payment page
+            accounts: "" // Payment method accounts
+        };
+
+        // Call the backend function to generate the payment URL
+        const paymentUrl = await createIfthenpayCheckout(paymentDetails);
+
+        console.log(paymentUrl); // Output the generated payment URL
+    } catch (error) {
+        console.error("Error initiating payment:", error);
+    }
+}
+
+
+
+
+
+export async function buildSuccessUrl(order, wixTransactionId) {
+  const baseSuccess = 'https://www.live-ls.com/thank-you';
+  
+  // Validate inputs
+  if (!order || !order._id) {
+    console.error('Error: order is null or missing _id', { order });
+    throw new Error('Invalid order: missing order ID');
+  }
+  if (!wixTransactionId) {
+    console.error('Error: wixTransactionId is missing', { wixTransactionId });
+    throw new Error('Invalid wixTransactionId');
+  }
+  const itemsRaw = Array.isArray(order?.description?.items) ? order.description.items : [];
+  if (itemsRaw.length === 0) {
+    console.warn('Warning: No items found in order.description.items', { order });
+  }
+
+  const params = new URLSearchParams();
+  params.set('tid', String(wixTransactionId));
+  params.set('oid', String(order._id));
+
+  itemsRaw.forEach((item, i) => {
+    if (!item) {
+      console.warn(`Warning: Item at index ${i} is null or undefined`);
+      return;
+    }
+    if (item._id) params.append(`items[${i}][Eid]`, String(item._id));
+    if (item.name) params.append(`items[${i}][Ename]`, String(item.name));
+    if (item.price !== undefined) params.append(`items[${i}][Eprice]`, String(item.price));
+    if (item.quantity !== undefined) params.append(`items[${i}][Equantity]`, String(item.quantity));
+  });
+
+  const successUrl = ensureHttps(`${baseSuccess}?${params.toString()}`);
+  return {
+    successUrl,
+    cancelUrl: ensureHttps('https://www.live-ls.com/'),
+    errorUrl: ensureHttps('https://www.live-ls.com/')
+  };
+}
+
+const ensureHttps = (url) => {
+  const safeStr = (v) => (v == null ? '' : String(v));
+  const s = safeStr(url).trim();
+  if (!s) return '';
+  try {
+    const u = new URL(s.startsWith('http') ? s : `https://${s.replace(/^\/+/, '')}`);
+    return u.toString();
+  } catch {
+    return '';
+  }
+};
+
+
+//https://www.live-ls.com/thank-you?tid=1c24be31-662d-4c63-8bb2-84bd51e5f99f&oid=2Z6B-R98C-58B&items%5B0%5D%5BEid%5D=7255a0b5-baf1-42d0-8917-0664cd3861d0&items%5B0%5D%5BEname%5D=OSWALDO+MONTENEGRO+-+PORTO+%7C+DATA+EXTRA-Eu+Quero+Ser+Feliz+Agora&items%5B0%5D%5BEprice%5D=3900&items%5B0%5D%5BEquantity%5D=1&items%5B1%5D%5BEid%5D=app_fee_item&items%5B1%5D%5BEname%5D=Application+Fee&items%5B1%5D%5BEprice%5D=100&items%5B1%5D%5BEquantity%5D=1
+
