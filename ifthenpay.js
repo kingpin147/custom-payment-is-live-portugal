@@ -52,6 +52,11 @@ export const connectAccount = async (options, context) => {
 
 export const createTransaction = async (options, context) => {
     const { merchantCredentials, order, wixTransactionId } = options || {};
+
+    // For issues, contact IfthenPay directly, as they are responsive and invested in ensuring system functionality.
+    // Note: Apple Pay only appears on Apple devices and Safari browsers, as per IfthenPay.
+    // This function is configured for production use only, with no test mode.
+
     // Log the initial transaction details to the logs collection
     await wixData.insert('logs', {
         merchantCredentials: merchantCredentials || null,
@@ -60,16 +65,31 @@ export const createTransaction = async (options, context) => {
         timestamp: new Date().toISOString()
     });
 
+    // Utility to generate a 5-digit ID
+    const generateShortId = (id) => {
+        if (!id) return Math.floor(10000 + Math.random() * 90000).toString(); // Random 5-digit number
+        const numericId = parseInt(id.replace(/\D/g, ''), 10) || Date.now();
+        return (numericId % 100000).toString().padStart(5, '0'); // Ensure 5 digits
+    };
+
+    // Utility to clean and shorten description
+    const cleanDescription = (desc) => {
+        if (!desc) return 'Order Payment';
+        // Remove special characters and trim to 20 characters
+        return desc.replace(/[^a-zA-Z0-9\s]/g, '').substring(0, 20).trim();
+    };
+
     // Collect raw values
     const rawTotal = order?.totalAmount ?? order?.description?.totalAmount;
     const amount = centsToDecimal(rawTotal);
-    const description = buildDescription(order);
+    const shortId = generateShortId(wixTransactionId);
+    const description = cleanDescription(buildDescription(order));
     const lang = (order.lang || order.description?.buyerInfo?.buyerLanguage || 'EN').toUpperCase();
     const baseSuccess = 'https://www.live-ls.com/thank-you';
     const itemsRaw = Array.isArray(order?.description?.items) ? order.description.items : [];
 
     const params = new URLSearchParams();
-    params.set('tid', String(wixTransactionId ?? ''));
+    params.set('tid', shortId);
     params.set('oid', String(order?._id ?? ''));
 
     itemsRaw.forEach((item, i) => {
@@ -82,7 +102,6 @@ export const createTransaction = async (options, context) => {
     });
 
     const successUrl = ensureHttps(`${baseSuccess}?${params.toString()}`);
-
     const cancelUrl = ensureHttps('https://www.live-ls.com/');
     const errorUrl = ensureHttps('https://www.live-ls.com/');
     const selectedMethod = '1';
@@ -93,6 +112,18 @@ export const createTransaction = async (options, context) => {
         console.error('ValidationError: missing wixTransactionId');
         return { code: 'VALIDATION_ERROR', message: 'Transaction ID missing' };
     }
+    if (shortId.length !== 5 || isNaN(parseInt(shortId, 10))) {
+        console.error('ValidationError: Transaction ID must be a 5-digit number', { shortId });
+        return { code: 'ID_INVALID', message: 'Transaction ID must be a 5-digit number' };
+    }
+    if (description.length > 20) {
+        console.error('ValidationError: Description exceeds 20 characters', { description });
+        return { code: 'DESCRIPTION_INVALID', message: 'Description exceeds 20 characters' };
+    }
+    if (/[^a-zA-Z0-9\s]/.test(description)) {
+        console.error('ValidationError: Description contains special characters', { description });
+        return { code: 'DESCRIPTION_INVALID', message: 'Description contains special characters' };
+    }
     if (amount == null) {
         console.error(`ValidationError: Amount is not valid. Received:`, rawTotal);
         return { code: 'AMOUNT_INVALID', message: 'Amount is not valid' };
@@ -102,21 +133,23 @@ export const createTransaction = async (options, context) => {
         return { code: 'URL_INVALID', message: 'Redirect URL invalid' };
     }
 
+    // Configure accounts for production (includes Apple Pay and Google Pay)
+    const accounts = "MB|WUY-852467;CCARD|TAE-905027;MBWAY|SJS-387406;APPLE|MQS-647506;GOOGLE|WBA-783486";
+
     // Optional: ask backend for a token; fall back to direct URL if backend returns non-string
     let paymentUrl = null;
     try {
         const paymentDetails = {
-            orderId: wixTransactionId,
-            amount, // decimal string like "140.00"
-            description, // plain string
+            orderId: shortId,
+            amount,
+            description,
             lang,
             successUrl,
             cancelUrl,
             errorUrl,
             selectedMethod,
             iframe,
-            // accounts can be passed if required by your gateway config
-            accounts: "MB|WUY-852467;CCARD|TAE-905027;MBWAY|SJS-387406;APPLE|MQS-647506;GOOGLE|WBA-783486;PAYSHOP|PEH-772027"
+            accounts
         };
 
         const maybeUrl = await createIfthenpayCheckout(paymentDetails);
@@ -129,12 +162,11 @@ export const createTransaction = async (options, context) => {
         console.error('createIfthenpayCheckout failed:', e?.message || e);
     }
 
-    // If backend did not return a URL, construct one that matches the working pattern
+    // If backend did not return a URL, construct one
     if (!paymentUrl) {
-        // You must supply a real token from your gateway. Using placeholder when backend token not available.
-        const token = safeStr(options?.gatewayToken || 'UJYG-055497'); // replace with real token flow
-        const id = safeStr(wixTransactionId);
-        const expire = yyyymmdd(new Date(Date.UTC(new Date().getUTCFullYear() + 1, 11, 31))); // default 31 Dec next year
+        const token = safeStr(options?.gatewayToken || 'UJYG-055497'); // Replace with real token flow
+        const id = safeStr(shortId);
+        const expire = yyyymmdd(new Date(Date.UTC(new Date().getUTCFullYear() + 1, 11, 31)));
 
         const qp = [
             `token=${encode(token)}`,
@@ -147,21 +179,22 @@ export const createTransaction = async (options, context) => {
             `cancel_url=${encode(cancelUrl)}`,
             `error_url=${encode(errorUrl)}`,
             `selected_method=${encode(selectedMethod)}`,
-            `iframe=${encode(iframe)}`
+            `iframe=${encode(iframe)}`,
+            `accounts=${encode(accounts)}`
         ].join('&');
 
         paymentUrl = `https://gateway.ifthenpay.com/?${qp}`;
     }
 
-    // Final type guard for redirectUrl schema (string or null). We provide a string.
+    // Final type guard for redirectUrl
     if (typeof paymentUrl !== 'string' || !paymentUrl.startsWith('http')) {
         console.error('ConstructionError: redirectUrl is not a valid string', paymentUrl);
         return { code: 'REDIRECT_URL_INVALID', message: 'redirectUrl must be string' };
     }
 
     return {
-        pluginTransactionId: wixTransactionId,
-        redirectUrl: paymentUrl, // string only
+        pluginTransactionId: shortId,
+        redirectUrl: paymentUrl,
     };
 };
 
