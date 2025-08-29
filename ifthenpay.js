@@ -49,34 +49,38 @@ export const connectAccount = async (options, context) => {
     const { credentials } = options;
     return { credentials };
 };
-
 export const createTransaction = async (options, context) => {
     const { merchantCredentials, order, wixTransactionId } = options || {};
 
-    // For issues, contact IfthenPay directly, as they are responsive and invested in ensuring system functionality.
-    // Note: Apple Pay only appears on Apple devices and Safari browsers, as per IfthenPay.
-    // This function is configured for production use only, with no test mode.
-
-    // Log the initial transaction details to the logs collection
+    // Log the initial transaction details
     await wixData.insert('logs', {
-        merchantCredentials: merchantCredentials || null,
-        order: order || null,
-        wixTransactionId: wixTransactionId || null,
+        phase: 'create_transaction_start',
+        data: { merchantCredentials, order, wixTransactionId },
         timestamp: new Date().toISOString()
     });
 
     // Utility to generate a 5-digit ID
     const generateShortId = (id) => {
-        if (!id) return Math.floor(10000 + Math.random() * 90000).toString(); // Random 5-digit number
+        if (!id) return Math.floor(10000 + Math.random() * 90000).toString();
         const numericId = parseInt(id.replace(/\D/g, ''), 10) || Date.now();
-        return (numericId % 100000).toString().padStart(5, '0'); // Ensure 5 digits
+        return (numericId % 100000).toString().padStart(5, '0');
     };
 
     // Utility to clean and shorten description
     const cleanDescription = (desc) => {
         if (!desc) return 'Order Payment';
-        // Remove special characters and trim to 20 characters
-        return desc.replace(/[^a-zA-Z0-9\s]/g, '').substring(0, 20).trim();
+        let cleaned = desc
+            .replace(/<[^>]+>/g, '')
+            .replace(/[^a-zA-Z0-9\s]/g, '')
+            .substring(0, 20)
+            .trim();
+        return cleaned;
+    };
+
+    // Utility to validate UUID
+    const isValidUUID = (id) => {
+        const regex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+        return regex.test(id);
     };
 
     // Collect raw values
@@ -88,26 +92,100 @@ export const createTransaction = async (options, context) => {
     const baseSuccess = 'https://www.live-ls.com/thank-you';
     const itemsRaw = Array.isArray(order?.description?.items) ? order.description.items : [];
 
+    // Filter valid ticket items
+    const items = itemsRaw.filter(item => item._id && isValidUUID(item._id));
+    await wixData.insert('logs', {
+        phase: 'items_filtered',
+        data: { filteredItems: items.map(item => item._id), count: items.length },
+        timestamp: new Date().toISOString()
+    });
+
+    if (items.length === 0) {
+        await wixData.insert('logs', {
+            phase: 'error',
+            data: { message: 'No valid ticket items found' },
+            timestamp: new Date().toISOString()
+        });
+        return { code: 'NO_VALID_ITEMS', message: 'No valid ticket items found' };
+    }
+
+    // Fetch all tickets in one query
+    const itemIds = items.map(item => item._id);
+    await wixData.insert('logs', {
+        phase: 'ticket_query_start',
+        data: { itemIds },
+        timestamp: new Date().toISOString()
+    });
+
+    const results = await wixData.query("Events/Tickets").hasSome("_id", itemIds).find();
+    const ticketsMap = new Map(results.items.map(ticket => [ticket._id, ticket]));
+    await wixData.insert('logs', {
+        phase: 'ticket_query_complete',
+        data: { foundTickets: results.items.length, itemIds },
+        timestamp: new Date().toISOString()
+    });
+
+    const tickets = [];
+    for (let item of items) {
+        try {
+            const ticket = ticketsMap.get(item._id);
+            if (ticket) {
+                tickets.push(ticket);
+                await wixData.insert('logs', {
+                    phase: 'ticket_processed',
+                    data: { itemId: item._id, ticket: { _id: ticket._id, price: ticket.price } },
+                    timestamp: new Date().toISOString()
+                });
+            } else {
+                throw new Error(`No ticket found for itemId: ${item._id}`);
+            }
+        } catch (e) {
+            await wixData.insert('logs', {
+                phase: 'ticket_error',
+                data: { itemId: item._id, msg: e.message, stack: e.stack },
+                timestamp: new Date().toISOString()
+            });
+            console.error(`Error processing ticket for itemId: ${item._id}`, e);
+        }
+    }
+
+    if (tickets.length === 0) {
+        await wixData.insert('logs', {
+            phase: 'error',
+            data: { message: 'No valid tickets found' },
+            timestamp: new Date().toISOString()
+        });
+        return { code: 'NO_VALID_TICKETS', message: 'No valid tickets found' };
+    }
+
+    // Verify all tickets belong to the same event
+    const eventIds = new Set(tickets.map(ticket => ticket.event));
+    if (eventIds.size > 1) {
+        await wixData.insert('logs', {
+            phase: 'error',
+            data: { message: 'All tickets must belong to the same event' },
+            timestamp: new Date().toISOString()
+        });
+        return { code: 'MULTIPLE_EVENTS', message: 'All tickets must belong to the same event' };
+    }
+    const eventId = eventIds.values().next().value;
+
+    await wixData.insert('logs', {
+        phase: 'event_id_verified',
+        data: { eventId, ticketCount: tickets.length },
+        timestamp: new Date().toISOString()
+    });
+
+    // Build simplified success URL
     const params = new URLSearchParams();
     params.set('tid', shortId);
     params.set('oid', String(order?._id ?? ''));
-
-    itemsRaw.forEach((item, i) => {
-        if (!item) return;
-        if (item._id) params.append(`items[${i}][Eid]`, String(item._id));
-        if (item.name) params.append(`items[${i}][Ename]`, String(item.name));
-        if (item.price !== undefined) params.append(`items[${i}][Eprice]`, String(item.price));
-        if (item.quantity !== undefined) params.append(`items[${i}][Equantity]`, String(item.quantity));
-        if (item.description !== undefined) params.append(`items[${i}][ESeatId]`, String(item.description));
-    });
-
+    params.set('eid', eventId);
     const successUrl = ensureHttps(`${baseSuccess}?${params.toString()}`);
     const cancelUrl = ensureHttps('https://www.live-ls.com/');
     const errorUrl = ensureHttps('https://www.live-ls.com/');
-    const selectedMethod = '1';
-    const iframe = 'true';
 
-    // Validate and log actionable errors
+    // Validate inputs
     if (!wixTransactionId) {
         console.error('ValidationError: missing wixTransactionId');
         return { code: 'VALIDATION_ERROR', message: 'Transaction ID missing' };
@@ -128,15 +206,13 @@ export const createTransaction = async (options, context) => {
         console.error(`ValidationError: Amount is not valid. Received:`, rawTotal);
         return { code: 'AMOUNT_INVALID', message: 'Amount is not valid' };
     }
-    if (!successUrl || !cancelUrl || !errorUrl) {
-        console.error('ValidationError: One or more redirect URLs are invalid', { successUrl, cancelUrl, errorUrl });
-        return { code: 'URL_INVALID', message: 'Redirect URL invalid' };
-    }
 
-    // Configure accounts for production (includes Apple Pay and Google Pay)
-    const accounts = "MB|WUY-852467;CCARD|TAE-905027;MBWAY|SJS-387406;APPLE|MQS-647506;GOOGLE|WBA-783486";
+    // Configure accounts for production
+    const accounts = "MB|WUY-852467;CCARD|TAE-905027;MBWAY|SJS-387406;APPLE|MQS-647506;GOOGLE|WBA-783486;PAYSHOP|PEH-772027";
+    const selectedMethod = '1';
+    const iframe = 'true';
 
-    // Optional: ask backend for a token; fall back to direct URL if backend returns non-string
+    // Attempt to create payment URL
     let paymentUrl = null;
     try {
         const paymentDetails = {
@@ -162,9 +238,9 @@ export const createTransaction = async (options, context) => {
         console.error('createIfthenpayCheckout failed:', e?.message || e);
     }
 
-    // If backend did not return a URL, construct one
+    // Fallback URL construction
     if (!paymentUrl) {
-        const token = safeStr(options?.gatewayToken || 'UJYG-055497'); // Replace with real token flow
+        const token = safeStr(options?.gatewayToken || 'UJYG-055497');
         const id = safeStr(shortId);
         const expire = yyyymmdd(new Date(Date.UTC(new Date().getUTCFullYear() + 1, 11, 31)));
 
@@ -173,20 +249,17 @@ export const createTransaction = async (options, context) => {
             `id=${encode(id)}`,
             `amount=${encode(amount)}`,
             `description=${encode(description)}`,
-            `expire=${encode(expire)}`,
             `lang=${encode(lang)}`,
             `success_url=${encode(successUrl)}`,
             `cancel_url=${encode(cancelUrl)}`,
             `error_url=${encode(errorUrl)}`,
             `selected_method=${encode(selectedMethod)}`,
-            `iframe=${encode(iframe)}`,
-            `accounts=${encode(accounts)}`
+            `iframe=${encode(iframe)}`
         ].join('&');
 
         paymentUrl = `https://gateway.ifthenpay.com/?${qp}`;
     }
 
-    // Final type guard for redirectUrl
     if (typeof paymentUrl !== 'string' || !paymentUrl.startsWith('http')) {
         console.error('ConstructionError: redirectUrl is not a valid string', paymentUrl);
         return { code: 'REDIRECT_URL_INVALID', message: 'redirectUrl must be string' };
@@ -197,6 +270,7 @@ export const createTransaction = async (options, context) => {
         redirectUrl: paymentUrl,
     };
 };
+
 
 export const refundTransaction = async (options, context) => {
     return { success: true };

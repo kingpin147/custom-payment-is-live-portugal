@@ -3,78 +3,39 @@ import wixData from 'wix-data';
 import { confirmOrder, getOrder } from 'backend/getEvent.web';
 
 $w.onReady(async function () {
-    let tickets = [];
-    let repeaterData = [];
-    let EventId;
-
     // Hide repeater initially
     $w('#ticketRepeater').hide();
 
-    function isValidUUID(id) {
-        const regex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-        return regex.test(id);
-    }
-
     try {
+        // Log start of onReady
+        await wixData.insert('logs', {
+            phase: 'onReady_start',
+            data: { message: 'Thank-you page initialization started' },
+            ts: new Date().toISOString()
+        });
+
+        // Extract query parameters
         const q = wixLocation.query;
         const tid = q.tid || '';
         const oid = q.oid || '';
-        if (!tid || !oid) {
-            throw new Error('Missing transactionId or orderId in URL');
+        const eid = q.eid || '';
+
+        if (!tid || !oid || !eid) {
+            throw new Error('Missing transactionId, orderId, or eventId in URL');
         }
 
-        // Parse URL items
-        let items = [];
-        let i = 0;
-        while (q[`items[${i}][Eid]`]) {
-            items.push({
-                itemId: q[`items[${i}][Eid]`],
-                name: q[`items[${i}][Ename]`],
-                quantity: Number(q[`items[${i}][Equantity]`]) || 0
-            });
-            i++;
-        }
-
-        if (items.length === 0) {
-            throw new Error('No items found in URL query');
-        }
-
-        // Filter valid UUID items
-        items = items.filter(item => isValidUUID(item.itemId));
-        if (items.length === 0) {
-            throw new Error('No valid ticket items found in URL query');
-        }
-
-        // Fetch tickets in one query
-        const itemIds = items.map(item => item.itemId);
-        const results = await wixData.query("Events/Tickets").hasSome("_id", itemIds).find();
-        const ticketsMap = new Map(results.items.map(ticket => [ticket._id, ticket]));
-
-        for (const item of items) {
-            const ticket = ticketsMap.get(item.itemId);
-            if (ticket) {
-                tickets.push(ticket);
-            } else {
-                throw new Error(`No ticket found for itemId: ${item.itemId}`);
-            }
-        }
-
-        if (tickets.length === 0) {
-            throw new Error('No valid tickets found');
-        }
-
-        // Verify all tickets belong to the same event
-        const eventIds = new Set(tickets.map(ticket => ticket.event));
-        if (eventIds.size > 1) {
-            throw new Error('All tickets must belong to the same event');
-        }
-        EventId = eventIds.values().next().value;
+        // Log URL query parameters
+        await wixData.insert('logs', {
+            phase: 'url_query',
+            data: { tid, oid, eid },
+            ts: new Date().toISOString()
+        });
 
         // Confirm order
         let confirmOrderResponse = null;
         try {
             const options = { orderNumber: [oid] };
-            confirmOrderResponse = await confirmOrder(EventId, options);
+            confirmOrderResponse = await confirmOrder(eid, options);
             await wixData.insert('logs', {
                 phase: 'confirm_order_complete',
                 data: { confirmOrderResponse },
@@ -91,8 +52,13 @@ $w.onReady(async function () {
 
         // Get order details
         let getOrderResponse = null;
-        const identifiers = { eventId: EventId, orderNumber: oid };
-        const options1 = { fieldset: ["TICKETS", "DETAILS"] };
+        const identifiers = {
+            eventId: eid,
+            orderNumber: oid
+        };
+        const options1 = {
+            fieldset: ["TICKETS", "DETAILS"]
+        };
         try {
             getOrderResponse = await getOrder(identifiers, options1);
             await wixData.insert('logs', {
@@ -111,12 +77,18 @@ $w.onReady(async function () {
         }
 
         // Prepare repeater data
-        repeaterData = getOrderResponse.map(ticket => ({
+        const repeaterData = getOrderResponse.map(ticket => ({
             ...ticket,
             qrCode: ticket.qrCode || '',
             checkInUrl: ticket.checkInUrl || '',
             walletPassUrl: ticket.walletPassUrl || ''
         }));
+
+        await wixData.insert('logs', {
+            phase: 'repeater_data_prepared',
+            data: { repeaterData },
+            ts: new Date().toISOString()
+        });
 
         // Bind to repeater
         $w('#ticketRepeater').data = repeaterData;
@@ -128,8 +100,18 @@ $w.onReady(async function () {
 
         // Show repeater
         $w('#ticketRepeater').show();
+        await wixData.insert('logs', {
+            phase: 'tickets_bound',
+            data: { count: repeaterData.length },
+            ts: new Date().toISOString()
+        });
 
     } catch (e) {
+        await wixData.insert('logs', {
+            phase: 'global_error',
+            data: { msg: e.message, stack: e.stack },
+            ts: new Date().toISOString()
+        });
         console.error('Global error:', e);
     }
 });
