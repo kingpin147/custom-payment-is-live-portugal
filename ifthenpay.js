@@ -49,24 +49,22 @@ export const connectAccount = async (options, context) => {
     const { credentials } = options;
     return { credentials };
 };
+
 export const createTransaction = async (options, context) => {
     const { merchantCredentials, order, wixTransactionId } = options || {};
 
-    // Log the initial transaction details
     await wixData.insert('logs', {
         phase: 'create_transaction_start',
         data: { merchantCredentials, order, wixTransactionId },
         timestamp: new Date().toISOString()
     });
 
-    // Utility to generate a 5-digit ID
     const generateShortId = (id) => {
         if (!id) return Math.floor(10000 + Math.random() * 90000).toString();
         const numericId = parseInt(id.replace(/\D/g, ''), 10) || Date.now();
         return (numericId % 100000).toString().padStart(5, '0');
     };
 
-    // Utility to clean and shorten description
     const cleanDescription = (desc) => {
         if (!desc) return 'Order Payment';
         let cleaned = desc
@@ -77,13 +75,11 @@ export const createTransaction = async (options, context) => {
         return cleaned;
     };
 
-    // Utility to validate UUID
     const isValidUUID = (id) => {
         const regex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
         return regex.test(id);
     };
 
-    // Collect raw values
     const rawTotal = order?.totalAmount ?? order?.description?.totalAmount;
     const amount = centsToDecimal(rawTotal);
     const shortId = generateShortId(wixTransactionId);
@@ -92,7 +88,6 @@ export const createTransaction = async (options, context) => {
     const baseSuccess = 'https://www.live-ls.com/thank-you';
     const itemsRaw = Array.isArray(order?.description?.items) ? order.description.items : [];
 
-    // Filter valid ticket items
     const items = itemsRaw.filter(item => item._id && isValidUUID(item._id));
     await wixData.insert('logs', {
         phase: 'items_filtered',
@@ -109,7 +104,6 @@ export const createTransaction = async (options, context) => {
         return { code: 'NO_VALID_ITEMS', message: 'No valid ticket items found' };
     }
 
-    // Fetch all tickets in one query
     const itemIds = items.map(item => item._id);
     await wixData.insert('logs', {
         phase: 'ticket_query_start',
@@ -158,7 +152,6 @@ export const createTransaction = async (options, context) => {
         return { code: 'NO_VALID_TICKETS', message: 'No valid tickets found' };
     }
 
-    // Verify all tickets belong to the same event
     const eventIds = new Set(tickets.map(ticket => ticket.event));
     if (eventIds.size > 1) {
         await wixData.insert('logs', {
@@ -176,12 +169,18 @@ export const createTransaction = async (options, context) => {
         timestamp: new Date().toISOString()
     });
 
-    // Build simplified success URL
+    // Construct success URL
     const params = new URLSearchParams();
     params.set('tid', shortId);
     params.set('oid', String(order?._id ?? ''));
     params.set('eid', eventId);
     const successUrl = ensureHttps(`${baseSuccess}?${params.toString()}`);
+    await wixData.insert('logs', {
+        phase: 'success_url_constructed',
+        data: { successUrl, tid: shortId, oid: order?._id, eid: eventId },
+        timestamp: new Date().toISOString()
+    });
+
     const cancelUrl = ensureHttps('https://www.live-ls.com/');
     const errorUrl = ensureHttps('https://www.live-ls.com/');
 
@@ -207,12 +206,10 @@ export const createTransaction = async (options, context) => {
         return { code: 'AMOUNT_INVALID', message: 'Amount is not valid' };
     }
 
-    // Configure accounts for production
     const accounts = "MB|WUY-852467;CCARD|TAE-905027;MBWAY|SJS-387406;APPLE|MQS-647506;GOOGLE|WBA-783486;PAYSHOP|PEH-772027";
     const selectedMethod = '1';
     const iframe = 'true';
 
-    // Attempt to create payment URL
     let paymentUrl = null;
     try {
         const paymentDetails = {
@@ -227,6 +224,11 @@ export const createTransaction = async (options, context) => {
             iframe,
             accounts
         };
+        await wixData.insert('logs', {
+            phase: 'create_ifthenpay_checkout',
+            data: { paymentDetails },
+            timestamp: new Date().toISOString()
+        });
 
         const maybeUrl = await createIfthenpayCheckout(paymentDetails);
         if (typeof maybeUrl === 'string' && maybeUrl.startsWith('http')) {
@@ -234,11 +236,20 @@ export const createTransaction = async (options, context) => {
         } else if (maybeUrl && typeof maybeUrl === 'object' && typeof maybeUrl.url === 'string') {
             paymentUrl = maybeUrl.url;
         }
+        await wixData.insert('logs', {
+            phase: 'ifthenpay_checkout_response',
+            data: { maybeUrl, paymentUrl },
+            timestamp: new Date().toISOString()
+        });
     } catch (e) {
+        await wixData.insert('logs', {
+            phase: 'ifthenpay_checkout_error',
+            data: { msg: e.message, stack: e.stack },
+            timestamp: new Date().toISOString()
+        });
         console.error('createIfthenpayCheckout failed:', e?.message || e);
     }
 
-    // Fallback URL construction
     if (!paymentUrl) {
         const token = safeStr(options?.gatewayToken || 'UJYG-055497');
         const id = safeStr(shortId);
@@ -258,6 +269,11 @@ export const createTransaction = async (options, context) => {
         ].join('&');
 
         paymentUrl = `https://gateway.ifthenpay.com/?${qp}`;
+        await wixData.insert('logs', {
+            phase: 'fallback_payment_url',
+            data: { paymentUrl, successUrl },
+            timestamp: new Date().toISOString()
+        });
     }
 
     if (typeof paymentUrl !== 'string' || !paymentUrl.startsWith('http')) {

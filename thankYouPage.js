@@ -10,7 +10,7 @@ $w.onReady(async function () {
         // Log start of onReady
         await wixData.insert('logs', {
             phase: 'onReady_start',
-            data: { message: 'Thank-you page initialization started' },
+            data: { message: 'Thank-you page initialization started', url: wixLocation.url },
             ts: new Date().toISOString()
         });
 
@@ -20,16 +20,18 @@ $w.onReady(async function () {
         const oid = q.oid || '';
         const eid = q.eid || '';
 
-        if (!tid || !oid || !eid) {
-            throw new Error('Missing transactionId, orderId, or eventId in URL');
-        }
-
-        // Log URL query parameters
+        // Log full URL and query parameters
         await wixData.insert('logs', {
             phase: 'url_query',
-            data: { tid, oid, eid },
+            data: { tid, oid, eid, fullUrl: wixLocation.url, query: q },
             ts: new Date().toISOString()
         });
+
+        if (!tid || !oid || !eid) {
+            const errorMsg = `Missing query parameters: ${!tid ? 'tid ' : ''}${!oid ? 'oid ' : ''}${!eid ? 'eid' : ''}`;
+           
+            throw new Error(errorMsg);
+        }
 
         // Confirm order
         let confirmOrderResponse = null;
@@ -48,6 +50,7 @@ $w.onReady(async function () {
                 ts: new Date().toISOString()
             });
             console.error('Confirm order failed:', e);
+            // Continue to getOrder even if confirmOrder fails
         }
 
         // Get order details
@@ -73,6 +76,7 @@ $w.onReady(async function () {
                 ts: new Date().toISOString()
             });
             console.error('Get order failed:', e);
+            
             throw new Error('Failed to retrieve order details');
         }
 
@@ -109,9 +113,10 @@ $w.onReady(async function () {
     } catch (e) {
         await wixData.insert('logs', {
             phase: 'global_error',
-            data: { msg: e.message, stack: e.stack },
+            data: { msg: e.message, stack: e.stack, url: wixLocation.url },
             ts: new Date().toISOString()
         });
         console.error('Global error:', e);
+        
     }
 });
